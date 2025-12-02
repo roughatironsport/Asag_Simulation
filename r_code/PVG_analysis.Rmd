@@ -1,0 +1,912 @@
+---
+title: "Auswertung_PVG"
+author: "Patric Schubert"
+date: "2025-07-11"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    numbered: true
+    number_sections: true
+    theme: journal
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+options(repos = c(CRAN = "https://cloud.r-project.org"))
+
+#loading relevant packages
+load_packages <- function(list_of_packages) {
+  new.packages <- list_of_packages[!(list_of_packages %in% installed.packages()[,"Package"])]
+  if(length(new.packages)) install.packages(new.packages)
+  for(package in list_of_packages){
+    suppressPackageStartupMessages(
+      library(
+        package, 
+        character.only = TRUE
+      )
+    )
+  }
+}
+
+load_packages(c('fitdistrplus','dplyr','ggplot2','DescTools','patchwork','mixtools','data.table','lubridate','arrow','signal','progress','plotly','knitr','DT','jsonlite'))
+
+#####################
+# Parameterübergabe #
+#####################
+
+params <- fromJSON("r_input.json")
+type <- params$type
+
+#########################
+# Funktionsdefinitionen #
+#########################
+
+CombiData <- function(data,spalten_del = NA) {
+  # data besteht aus PVG Einträgen: für jeden Schadwagen werden meist mehrere 
+  # Zeilen angelegt.
+  # Die Funktion iteriert durch den Datensatz und liefert als 
+  # Output einen Zug pro Zeile mit Schäden und ArbeitenamZug sowie Begutachtungszeiten
+  # 1.Zusammenfassung von Schadwagen zu einer Zeile
+  # 2.Zusammenfassung aller Schadwagen zu einem Zug
+  Infos = list()
+  
+  InitialLength = nrow(data)
+  Infos <- append(Infos, list(InitialLength = InitialLength))
+  
+  # eine Spalte num einfügen
+  data$num <- seq_len(InitialLength)
+  
+  # Daten bereinigen
+  #data <- data %>% filter(taetigkeit == 0) 
+  data <- data %>% dplyr::filter(anzWeitereMitarbeiter == 0)
+  data <- data %>% dplyr::filter(abfahrtZugLaenge > 0) 
+  data <- data %>% dplyr::filter(bemerkung != 'Abbruch')
+  AfterFilterLength = nrow(data)
+  Infos <- append(Infos, list(AfterFilterLength = AfterFilterLength))
+  
+  data <- data %>% arrange(zugnummer)
+  
+  # 1. wenn zugnummer = zugdatum etc, dann nimm nur die letzte der (meist) drei Zeilen
+  data <- data %>%
+    mutate(
+      zugnum = zugnummer == lead(zugnummer),
+      zugDat = zugDatum == lead(zugDatum),
+      beginn = beginnDatumZeit == lead(beginnDatumZeit),
+      ende = endeDatumZeit == lead(endeDatumZeit),
+      schad = schaden == lead(schaden),
+      aaf = arbeitAmFz == lead(arbeitAmFz)
+    ) %>%
+    dplyr::filter(!(zugnum & zugDat & beginn & ende & schad & aaf & row_number() < n())) %>%
+    select(-zugnum, -zugDat, -beginn, -ende, -schad, -aaf)
+  
+  DelDoublesLength = nrow(data)
+  Infos <- append(Infos, list(DelDoublesLength = DelDoublesLength))
+  
+  data <- data %>% arrange(zugnummer)
+  data <- data %>%
+    select(-any_of(spalten_del))
+  
+  df_Wagen = data
+  
+  # 2. Alle Wagen zu einem Zug zusammenfassen
+  # Prüfen, ob die nächsten Einträge gleich sind
+  datax <- data %>%
+    mutate(
+      zugnum = zugnummer == lead(zugnummer),
+      zugDat = zugDatum == lead(zugDatum),
+      abfahrt = abfahrtZug == lead(abfahrtZug)
+    )
+  
+  pb <- progress_bar$new(
+    total = nrow(data),
+    format = "  Fortschritt [:bar] :percent in :elapsed"
+  )
+  
+  # Initialisiere eine Liste, um die neuen Zeilen zu speichern
+  new_rows <- list()
+  
+  # Iteriere durch die Zeilen des DataFrames
+  i <- 1
+  while (i <= nrow(data)) {
+    pb$tick()
+    # Wenn die aktuelle und die nächste Zeile die gleiche zugnummer, zugDatum, abfahrtszeit haben
+    if (i < nrow(data) && datax$zugnum[i] && datax$zugDat[i] && datax$abfahrt[i]) {
+      # Initialisiere Listen, um schaden und arbeitAmFz Werte zu speichern
+      schaden_list <- if (!is.na(data$schaden[i])) c(data$schaden[i]) else c()
+      arbeitAmFz_list <- if (!is.na(data$arbeitAmFz[i])) c(data$arbeitAmFz[i]) else c()
+      
+      # Iteriere durch aufeinanderfolgende Zeilen mit der gleichen zugnummer und zugDatum
+      while (i < nrow(data) && datax$zugnum[i] && datax$zugDat[i]) {
+        i <- i + 1
+        pb$tick()
+        if (!is.na(data$schaden[i])) schaden_list <- c(schaden_list, data$schaden[i])
+        if (!is.na(data$arbeitAmFz[i])) arbeitAmFz_list <- c(arbeitAmFz_list, data$arbeitAmFz[i])
+      }
+      
+      # Erstelle eine neue Zeile mit kombinierten schaden und arbeitAmFz Werten
+      new_row <- data.frame(
+        num = data$num[i - length(schaden_list)],
+        zugnummer = data$zugnummer[i - length(schaden_list)],
+        zugDatum = data$zugDatum[i - length(schaden_list)],
+        schaden = paste(schaden_list, collapse = ","),
+        arbeitAmFz = paste(arbeitAmFz_list, collapse = ","),
+        numSchaden = length(schaden_list),
+        numArbeit = length(arbeitAmFz_list),
+        differenzMinuten = as.numeric(difftime(data$endeDatumZeit[i - length(schaden_list)], data$beginnDatumZeit[i - length(schaden_list)], units = "mins")),
+        
+        begutachtungMinuten = ifelse(as.numeric(difftime(data$endeDatumZeit[i], data$beginnDatumZeit[i], units = "mins")) > data$wegezeit[i], 
+                                     as.numeric(difftime(data$endeDatumZeit[i], data$beginnDatumZeit[i], units = "mins")) - data$wegezeit[i], 
+                                     0)
+      )
+      
+      # Füge die zusätzlichen Spalten hinzu
+      for (col in setdiff(names(data), c("num", "zugnummer", "zugDatum", "schaden", "arbeitAmFz"))) {
+        new_row[[col]] <- data[[col]][i - length(schaden_list)]
+      }
+      
+      # Füge die neue Zeile zur Liste der neuen Zeilen hinzu
+      new_rows <- append(new_rows, list(new_row))
+    } else {
+      # Wenn die aktuelle Zeile nicht die gleiche zugnummer und zugDatum wie die nächste Zeile hat
+      schaden_value <- if (!is.na(data$schaden[i])) data$schaden[i] else NA
+      arbeitAmFz_value <- if (!is.na(data$arbeitAmFz[i])) data$arbeitAmFz[i] else NA
+      
+      new_row <- data.frame(
+        num = data$num[i],
+        zugnummer = data$zugnummer[i],
+        zugDatum = data$zugDatum[i],
+        schaden = if (!is.na(schaden_value)) schaden_value else "",
+        arbeitAmFz = if (!is.na(arbeitAmFz_value)) arbeitAmFz_value else "",
+        numSchaden = if (!is.na(schaden_value)) 1 else 0,
+        numArbeit = if (!is.na(arbeitAmFz_value)) 1 else 0,
+        differenzMinuten = as.numeric(difftime(data$endeDatumZeit[i], data$beginnDatumZeit[i], units = "mins")),
+        begutachtungMinuten = ifelse(as.numeric(difftime(data$endeDatumZeit[i], data$beginnDatumZeit[i], units = "mins")) > data$wegezeit[i], 
+                                     as.numeric(difftime(data$endeDatumZeit[i], data$beginnDatumZeit[i], units = "mins")) - data$wegezeit[i], 
+                                     0)
+      )
+      
+      # Füge die zusätzlichen Spalten hinzu
+      for (col in setdiff(names(data), c("num", "zugnummer", "zugDatum", "schaden", "arbeitAmFz"))) {
+        new_row[[col]] <- data[[col]][i]
+      }
+      
+      # Füge die neue Zeile zur Liste der neuen Zeilen hinzu
+      new_rows <- append(new_rows, list(new_row))
+    }
+    i <- i + 1
+  }
+  
+  #df_Zuege <- do.call(rbind, new_rows)
+  df_Zuege <- rbindlist(new_rows)
+  df_ZuegeLength = nrow(df_Zuege)
+  Infos <- append(Infos, list(df_ZuegeLength = df_ZuegeLength))
+  
+  return(list(df_Zuege, df_Wagen, Infos))
+}
+
+load_data <- function(type) {
+  if (type == "SEE") {
+    # CSV-Datei einlesen
+    x <- read.csv("C:/Users/rough/Desktop/CoDive/Daten_ASAG/Seelze 01-12_2024.csv")
+  } else if (type %in% c("BSS", "MN", "TK")) {
+    # Parquet-Datei einlesen
+    library(arrow)
+    df <- as.data.frame(read_parquet("C:/Users/rough/Desktop/CoDive/Daten_ASAG/MN_BSS_TK_2024.parquet"))
+    
+    # Nach dem gewünschten Bezirk filtern
+    x <- df[df$bezirkAbkuerzungOrt == type, ]
+  } else {
+    stop("Ungültiger Typ. Bitte 'SEE', 'BSS', 'MN' oder 'TK' angeben.")
+  }
+  
+  return(x)
+}
+
+```
+
+# Datei-Import und -preprocessing
+
+```{r LOAD PVG DATA, include = FALSE}
+x = load_data(type)
+```
+
+PVG-Datei: Die Analyse basiert auf dem Datensatz `r type`.
+
+```{r GENERATE TRAINS FROM PVG, include=FALSE}
+
+#Variablen-formate zuweisen
+  x$zugDatum <- as.POSIXct(x$zugDatum, format="%Y-%m-%dT%H:%M")
+  x$beginnDatumZeit <- as.POSIXct(x$beginnDatumZeit, format="%Y-%m-%dT%H:%M")
+  x$endeDatumZeit <- as.POSIXct(x$endeDatumZeit, format="%Y-%m-%dT%H:%M")
+  x$abfahrtZug <- as.POSIXct(x$abfahrtZugSoll, format="%Y-%m-%dT%H:%M")
+
+# Anwenden der Funktion CombiData auf den Datensatz
+list_out = CombiData(x,c('taetigkeit',
+                     'ArtBremsprobe',
+                     'bemerkung',
+                     'behandlungsSchadSbh'))
+
+y = list_out[[1]]
+y_length = nrow(y)
+y <- y %>% dplyr::filter(abfahrtZugFahrzeuge > 9) 
+y <- y %>% dplyr::filter(begutachtungMinuten > 20) 
+y_filt_length = nrow(y)
+
+Infos = list_out[[3]]
+```
+
+## Allgemeine Informationen (Rohdaten):
+Die Daten umfassen **`r as.numeric(difftime(max(x$zugDatum, na.rm = TRUE), min(x$zugDatum, na.rm = TRUE), units = "days"))`** Tage im Zeitraum vom `r min(x$zugDatum, na.rm = TRUE)` bis
+`r max(x$zugDatum, na.rm = TRUE)`. Es gibt `r n_distinct(x$zugnummer)` verschiedene Zugnummern im Datensatz. Die Anzahl unterschiedlicher Zugachsen beträgt `r n_distinct(x$abfahrtZugAchsen)`.
+
+## Vorverarbeitung: 
+Die initiale Größe des Datensatzes betrug `r Infos[[1]]`. Nach erster Filterung (nur ein Wagenmeister war zuständig [anzWeitereMitarbeiter == 0], Mindestzuglänge größer als Null [abfahrtZugLaenge > 0], reguläre digitale Bearbeitung [bemerkung != 'Abbruch']) war diese `r Infos[[2]]`. Reduktion der PVG-Doubletten führte dann zu `r Infos[[3]]` Wageneinträgen. Nach Zusammenfassung der Wageneinträge (initiale Einträge im PVG-System) zu Zügen betrug die Größe `r y_length`. Eine finale Filterung (Mindestzuglänge von mindestens 10 Wagen [abfahrtZugFahrzeuge > 9], Die Mindestbegutachtungszeit durch Wagenmeister größer als 20 Minuten [begutachtungMinuten > 20]) ergab `r y_filt_length` betrachtete Züge (Reduktion um weitere `r y_length-y_filt_length` Züge).
+
+## Allgemeine Informationen (gefilterte Daten):
+Nach derFilterung beträgt der Zeitraum **`r as.numeric(difftime(max(y$zugDatum, na.rm = TRUE), min(y$zugDatum, na.rm = TRUE), units = "days"))`** Tage im Zeitraum vom `r min(y$zugDatum, na.rm = TRUE)` bis `r max(y$zugDatum, na.rm = TRUE)`. Es gibt `r n_distinct(y$zugnummer)` verschiedene Zugnummern im gefilterten Datensatz. Die Anzahl unterschiedlicher Zugachsen beträgt `r n_distinct(y$abfahrtZugAchsen)`.
+
+## Vergleich - Rohdaten vs. Gefilterte Daten:
+
+```{r COMPARISON TABLE, echo=FALSE}
+library(dplyr)
+library(knitr)
+
+# Funktion zur Berechnung der Kennwerte
+berechne_stats <- function(df, variable) {
+  c(
+    Minimum = min(df[[variable]], na.rm = TRUE),
+    Q1 = quantile(df[[variable]], 0.25, na.rm = TRUE),
+    Median = median(df[[variable]], na.rm = TRUE),
+    Q3 = quantile(df[[variable]], 0.75, na.rm = TRUE),
+    Maximum = max(df[[variable]], na.rm = TRUE)
+  )
+}
+
+# Statistiken berechnen
+fahrzeuge_stats <- rbind(
+  Rohdaten = berechne_stats(x, "abfahrtZugFahrzeuge"),
+  Gefiltert = berechne_stats(y, "abfahrtZugFahrzeuge")
+)
+
+laenge_stats <- rbind(
+  Rohdaten = berechne_stats(x, "abfahrtZugLaenge"),
+  Gefiltert = berechne_stats(y, "abfahrtZugLaenge")
+)
+
+# Tabellen anzeigen
+kable(fahrzeuge_stats, caption = "Anzahl der Wagen pro Zug", digits = 1)
+kable(laenge_stats, caption = "Länge der Wagen pro Zug", digits = 1)
+```
+
+# Statistiken zum gefilterten Datensatz:
+
+Das folgende Plot zeigt die Häufigkeit bearbeiteter Züge über den Zeitraum.
+
+```{r FREQUENCIES, echo=FALSE}
+# Erstellen eines DataFrames mit der Häufigkeit der Daten
+data_freq <- y %>%
+  group_by(zugDatum) %>%
+  summarise(frequency = n())
+
+# Grafische Darstellung
+ggplot(data_freq, aes(x = zugDatum, y = frequency)) +
+  geom_line() +
+  geom_point() +
+  labs(title = "Häufigkeit der Daten über die Zeit",
+       x = "Datum",
+       y = "Häufigkeit") +
+  theme_minimal()
+```
+
+Eine Frequenzanalyse soll Periodizitäten im Datensaz aufzeigen.
+
+```{r FOURIER ANALYSIS, echo=FALSE}
+#Frequenzanalyse
+
+# Schritt 1: Frequenzdaten extrahieren
+freq <- data_freq$frequency
+# Schritt 2: Fourier-Transformation
+fft_result <- fft(freq)
+# Schritt 3: Frequenzachsen berechnen
+n <- length(freq)
+sampling_interval <- 1  # tägliche Daten
+freq_axis <- (0:(n - 1)) / (n * sampling_interval)
+# Schritt 4: Amplituden berechnen
+amplitude <- Mod(fft_result)
+# Schritt 5: Nur erste Hälfte (symmetrisch)
+half_n <- floor(n / 2)
+freq_axis_half <- freq_axis[1:half_n]
+amplitude_half <- amplitude[1:half_n]
+# Schritt 6: Plotten des Spektrums
+plot(freq_axis_half, amplitude_half, type = "l", col = "blue",
+     xlab = "Frequenz (1/Tag)", ylab = "Amplitude",
+     main = "Fourier-Spektrum der Frequenzdaten")
+# Schritt 7: Dominante Frequenz und Periode
+dominant_index <- which.max(amplitude_half[-1]) + 1  # -1 um DC-Komponente zu ignorieren
+dominant_frequency <- freq_axis_half[dominant_index]
+approximated_period <- 1 / dominant_frequency
+text(0.1, 12000, labels = paste("Dom. Peak = ", round(dominant_frequency, 2)), col = "black", cex = 0.8, adj = c(0, 0))
+text(0.1, 10000, labels = paste("Appr. Period [d] = ", round(approximated_period, 2)), , col = "black", cex = 0.8, adj = c(0, 0))
+
+```
+
+Die dominante Frequenz liegt bei `r dominant_frequency` Zyklen pro Tag, die approximierte Periode bei `r approximated_period` Tagen.
+
+```{r BARPLOT AXES, echo=FALSE}
+
+# Häufigkeitstabelle erstellen
+achsen_freq <- as.data.frame(table(y$abfahrtZugAchsen))
+colnames(achsen_freq) <- c("Zugachsen", "Häufigkeit")
+
+# Barplot mit ggplot2
+ggplot(achsen_freq, aes(x = Zugachsen, y = Häufigkeit)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  theme_minimal() +
+  labs(
+    title = "Diskrete Häufigkeitsverteilung der Zugachsen nach Filterung",
+    x = "Anzahl der Zugachsen",
+    y = "Häufigkeit"
+  )
+
+```
+
+```{r DAMAGES, echo=FALSE}
+data = y
+# Durchschnittliche Anzahl der Einträge in 'schaden' pro 'zugnummer' berechnen
+average_schaden_per_zugnummer <- data %>%
+  group_by(zugnummer) %>%
+  summarise(
+    SchaedenproTag = mean(numSchaden),
+    absoluteAnzSchaeden = sum(numSchaden),
+    Tage = n()
+  )
+
+# ggplot erstellen
+p <- ggplot(average_schaden_per_zugnummer, aes(x = zugnummer, y = SchaedenproTag)) +
+  geom_bar(stat = "identity") +
+  labs(title = "Durchschnittliche Anzahl der Einträge in 'schaden' pro 'zugnummer'",
+       x = "Zugnummer",
+       y = "Anzahl Schaeden pro Tag") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+# In interaktiven Plot umwandeln
+
+ggplotly(p) %>% layout(
+  title = list(text = "<br>Durchschnittliche Anzahl der Einträge in 'schaden' pro 'zugnummer'", 
+               x = 0.5, font = list(size = 18)),
+  margin = list(t = 100, b = 120),  # t = top margin
+  xaxis = list(tickangle = -45))
+```
+
+```{r QUANTILES,include=FALSE}
+#Berechnung der Quartile und des Interquartilsabstands (IQR)
+Q1 <- quantile(average_schaden_per_zugnummer$SchaedenproTag, 0.25)
+MED <- median(average_schaden_per_zugnummer$SchaedenproTag)
+Q3 <- quantile(average_schaden_per_zugnummer$SchaedenproTag, 0.75)
+IQR <- Q3 - Q1
+
+# Berechnung des oberen Whiskers
+upper_whisker <- Q3 + 1.5 * IQR
+
+# Filtern der Zugnummern, bei denen die Schäden größer sind als der obere Whisker
+outliers_df <- average_schaden_per_zugnummer %>%
+  dplyr::filter(SchaedenproTag > upper_whisker)
+```
+
+Die Züge weisen im Median `r MED` (IQR:`r IQR`) Schäden auf. Das obere Quartil ist `r Q3`, das untere Quartil ist `r Q1`. Im Folgenden sind diejenigen Züge gelistet, die nch dem Tukey-Kriterium (oberes Quartil plus 1,5fachen Interquartilabstand) viele Schäden aufwiesen.
+
+```{r DATATABLE, echo=FALSE}
+
+# Interaktive Tabelle mit Suchfunktion, Sortierung, Scrollen
+datatable(outliers_df, 
+          caption = "Interaktive Übersicht der Ausreißer",
+          options = list(pageLength = 10, scrollX = TRUE))
+```
+
+## Tagesverteilungen
+Die nachfolgende Grafik zeigt die durchschnittliche Begutachtungszeit in Minuten (begutachtungMinuten) und die durchschnittliche Länge der Züge. 
+
+```{r GROUP BY DATE ANALYSE LENGTH, echo = FALSE}
+# Daten nach Datum gruppieren und die durchschnittliche Differenz sowie AbfahrtZugLaenge berechnen
+# Daten nach Datum gruppieren und die durchschnittliche Differenz sowie AbfahrtZugLaenge berechnen
+data_tagesverteilung <- data %>%
+  mutate(tag = as.Date(zugDatum)) %>%
+  group_by(tag) %>%
+  summarise(durchschnittlicheDifferenz = mean(begutachtungMinuten, na.rm = TRUE),
+            stabwDifferenz = sd(begutachtungMinuten, na.rm = TRUE),
+            durchschnittlicheAbfahrtZugLaenge = mean(abfahrtZugLaenge, na.rm = TRUE),
+            stabwAbfahrtZugLaenge = sd(abfahrtZugLaenge, na.rm = TRUE),
+            durchschnittlicheWegezeit = mean(wegezeit, na.rm = TRUE),
+            durchschnittlicheAnzSchaeden = mean(numSchaden, na.rm = TRUE),
+            anzahlZuege = n())
+
+# Grand Mean und Standardabweichung berechnen
+grand_mean <- mean(data_tagesverteilung$durchschnittlicheDifferenz, na.rm = TRUE)
+grand_sd <- sd(data_tagesverteilung$durchschnittlicheDifferenz, na.rm = TRUE)
+
+# Verteilung visualisieren und Linien für Grand Mean, Standardabweichung und durchschnittliche AbfahrtZugLaenge hinzufügen
+ggplot(data_tagesverteilung, aes(x = tag)) +
+  geom_line(aes(y = durchschnittlicheDifferenz, color = "Durchschnittliche Differenz")) +
+  geom_line(aes(y = durchschnittlicheAbfahrtZugLaenge, color = "Durchschnittliche AbfahrtZugLaenge")) +
+  geom_hline(yintercept = grand_mean, color = "blue", linetype = "dashed", linewidth = 1) +
+  geom_hline(yintercept = grand_mean + grand_sd, color = "red", linetype = "dotted", linewidth = 1) +
+  geom_hline(yintercept = grand_mean - grand_sd, color = "red", linetype = "dotted", linewidth = 1) +
+  scale_y_continuous(name = "Durchschnittliche Differenz (Minuten)", sec.axis = sec_axis(~ ., name = "Durchschnittliche AbfahrtZugLaenge")) +
+  labs(title = "Verteilung der durchschnittlichen Differenz und AbfahrtZugLaenge über alle Tage",
+       x = "Datum",
+       subtitle = paste("Grand Mean der Differenz:", round(grand_mean, 2), "Minuten\nStandardabweichung der Differenz:", round(grand_sd, 2), "Minuten")) +
+  scale_color_manual(values = c("Durchschnittliche Differenz" = "black", "Durchschnittliche AbfahrtZugLaenge" = "green")) +
+  theme_minimal()
+```
+
+```{r INTERACTIVE TABLE, echo=FALSE}
+# Alle numerischen Spalten auf 2 Nachkommastellen runden
+data_gerundet <- data_tagesverteilung %>%
+  mutate(across(where(is.numeric), ~ round(., 2)))
+
+# Interaktive Tabelle mit Scrollen und gerundeten``` Werten
+datatable(data_gerundet, 
+          caption = "Tagesverteilung",
+          options = list(
+            pageLength = 10,
+            scrollX = TRUE,
+            autoWidth = TRUE,
+            columnDefs = list(list(width = '150px', targets = "_all"))
+          ))
+```
+
+
+## Zusammenhang der Begutachtungszeit zu weiteren Variablen
+Für das nächste Plot wurden die Daten Begutachtungszeit, Zuglänge und zusätzlich Wegezeiten, Anzahl der Schäden normiert um wechselseitige Abhängigkeiten zu evaluieren. 
+
+```{r NORMALISATION, echo=FALSE}
+# Normierung der Daten
+data_tagesverteilung <- data_tagesverteilung %>%
+  mutate(normierteAbfahrtZugLaenge = (durchschnittlicheAbfahrtZugLaenge - min(durchschnittlicheAbfahrtZugLaenge)) / (max(durchschnittlicheAbfahrtZugLaenge) - min(durchschnittlicheAbfahrtZugLaenge)),
+         normierteWegezeit = (durchschnittlicheWegezeit - min(durchschnittlicheWegezeit)) / (max(durchschnittlicheWegezeit) - min(durchschnittlicheWegezeit)),
+         normierteDifferenz = (durchschnittlicheDifferenz - min(durchschnittlicheDifferenz)) / (max(durchschnittlicheDifferenz) - min(durchschnittlicheDifferenz)),
+         normierteAnzSchaeden = (durchschnittlicheAnzSchaeden - min(durchschnittlicheAnzSchaeden)) / (max(durchschnittlicheAnzSchaeden) - min(durchschnittlicheAnzSchaeden)))
+
+# Verteilung visualisieren und normierte Linien hinzufügen
+ggplot(data_tagesverteilung, aes(x = tag)) +
+  geom_line(aes(y = normierteAbfahrtZugLaenge, color = "Normierte AbfahrtZugLaenge")) +
+  geom_line(aes(y = normierteWegezeit, color = "Normierte Wegezeit")) +
+  geom_line(aes(y = normierteAnzSchaeden, color = "Normierte AnzSchaeden")) +
+  geom_line(aes(y = normierteDifferenz, color = "Normierte Begutachtungszeit")) +
+  labs(title = "Normierte Verteilung der durchschnittlichen Differenz und AbfahrtZugLaenge über alle Tage",
+       x = "Datum",
+       y = "Normierter Wert",
+       color = "Variable") +
+  scale_color_manual(values = c("Normierte Begutachtungszeit" = "black", "Normierte AbfahrtZugLaenge" = "green", "Normierte Wegezeit" = "yellow", "Normierte AnzSchaeden" = "lightblue")) +
+  theme_minimal()
+```
+
+
+```{r CORRELATIONS, include=FALSE}
+cor1 = cor(data_tagesverteilung$normierteDifferenz,data_tagesverteilung$normierteAbfahrtZugLaenge)
+cor2 = cor(data_tagesverteilung$normierteDifferenz,data_tagesverteilung$normierteWegezeit)
+cor3 = cor(data_tagesverteilung$normierteDifferenz,data_tagesverteilung$normierteAnzSchaeden)
+```
+
+Es ergeben sich folgende Korrelationen: r=`r round(cor1,1)` (Korrelation zwischen Begutachtungszeit und Zuglänge), r=`r round(cor2,1)` (Korrelation zwischen Begutachtungszeit und Wegezeit) und r=`r round(cor3,1)` (Korrelation zwischen Begutachtungszeit und der Anzahl der Schäden).
+
+## Analyse der Begutachtungszeit 
+
+Die Begutachtungszeit (1. in Minuten pro Meter und 2. in Minuten pro Achse) wird im folgenden pro Zug analysiert. 
+
+```{r MINUTES PER METER, echo=FALSE}
+data$MinproMeter <- data$begutachtungMinuten / data$abfahrtZugLaenge / 2
+# Grand Mean und Standardabweichung berechnen
+grand_mean_m <- mean(data$MinproMeter, na.rm = TRUE)
+grand_sd_m <- sd(data$MinproMeter, na.rm = TRUE)
+
+# Plot der Werte in der Spalte 'MinproMeter'
+plot1 <- ggplot(data, aes(x = seq_along(MinproMeter), y = MinproMeter)) +
+  geom_point(size = 0.5) +
+  geom_line(linewidth = 0.2) +
+  geom_hline(yintercept = grand_mean_m, color = "blue", linetype = "dashed", linewidth = 1) +
+  geom_hline(yintercept = grand_mean_m + grand_sd_m, color = "green", linetype = "dotted", linewidth = 1) +
+  geom_hline(yintercept = grand_mean_m - grand_sd_m, color = "green", linetype = "dotted", linewidth = 1) +
+  labs(title = "Verteilung der Werte in der Spalte 'MinproMeter'",
+       x = "Index",
+       y = "Verhältnis (begutachtungMinuten / AbfahrtZugLaenge) [min/m]",
+       subtitle = paste("Grand Mean:", round(grand_mean_m, 2), "\nStandardabweichung:", round(grand_sd_m, 2))) +
+  theme_minimal()
+
+# Histogramm der y-Werte (MinproMeter) mit eingeschränkter x-Range
+plot2 <- ggplot(data, aes(x = MinproMeter)) +
+  geom_histogram(binwidth = 0.01, fill = "blue", color = "black", alpha = 0.7) +
+  labs(title = "Histogramm der Werte in der Spalte 'MinproMeter'",
+       x = "Verhältnis (begutachtungMinuten / AbfahrtZugLaenge) [min/m]",
+       y = "Häufigkeit") +
+  xlim(0, 0.5) +
+  theme_minimal()
+
+# Beide Plots untereinander darstellen
+combined_plot <- plot1 / plot2
+
+# Plot anzeigen
+print(combined_plot)
+```
+
+```{r MINUTES PER AXES, echo=FALSE}
+data$MinproAchse <- data$begutachtungMinuten / data$abfahrtZugAchsen / 2
+# Grand Mean und Standardabweichung berechnen
+grand_mean <- mean(data$MinproAchse, na.rm = TRUE)
+grand_sd <- sd(data$MinproAchse, na.rm = TRUE)
+
+# Plot der Werte in der Spalte 'MinproAchse' mit farblich gekennzeichneten Punkten und Legende
+plot1 <- ggplot(data, aes(x = seq_along(MinproAchse), y = MinproAchse)) +
+  geom_point(aes(color = ifelse(schaden != "", "Schaden", "Kein Schaden")), size = 1) +
+  geom_line(linewidth = 0.2) +
+  geom_hline(yintercept = grand_mean, color = "blue", linetype = "dashed", linewidth = 1) +
+  geom_hline(yintercept = grand_mean + grand_sd, color = "green", linetype = "dotted", linewidth = 1) +
+  geom_hline(yintercept = grand_mean - grand_sd, color = "green", linetype = "dotted", linewidth = 1) +
+  labs(title = "Verteilung der Werte in der Spalte 'MinproAchse'",
+       x = "Index",
+       y = "Verhältnis (begutachtungMinuten / AbfahrtZugAchsen) [min]",
+       subtitle = paste("Grand Mean:", round(grand_mean, 2), "\nStandardabweichung:", round(grand_sd, 2)),
+       color = "Legende") +
+  scale_color_manual(values = c("Schaden" = "red", "Kein Schaden" = "black")) +
+  theme_minimal()
+
+# Histogramm der y-Werte (MinproAchse) mit eingeschränkter x-Range
+plot2 <- ggplot(data, aes(x = MinproAchse)) +
+  geom_histogram(binwidth = 0.02, fill = "blue", color = "black", alpha = 0.7) +
+  labs(title = "Histogramm der Werte in der Spalte 'MinproAchse'",
+       x = "Verhältnis (begutachtungMinuten / AbfahrtZugAchsen) [min]",
+       y = "Häufigkeit") +
+  xlim(0, 1.5) +
+  theme_minimal()
+
+# Beide Plots untereinander darstellen
+combined_plot <- plot1 / plot2
+
+# Plot anzeigen
+print(combined_plot)
+```
+
+Im Durchschnitt liegt die Begutachtungszeit bei M=`r round(grand_mean_m,2)` Minuten pro Meter (SD= `r round(grand_sd_m,2)`) oder M=`r round(grand_mean,2)` Minuten pro Achse (SD= `r round(grand_sd,2)`). 
+
+## Länge von Zügen
+
+```{r NUMBER OF WAGONS,echo=FALSE}
+#Wie lang sind Züge? --> Anzahl Fahrzeuge
+x = data$abfahrtZugFahrzeuge
+a <- mean(x)
+b <- sd(x)
+# Histogramm der Daten erstellen
+hist(x, breaks = 50, probability = TRUE, xlab = "Value", col = "lightblue", main = "Anzahl Wagons")
+curve(dnorm(x, a, b), add = TRUE, col = "red", lwd = 2)
+#Textbox hinzufügen
+text(x = max(x) * 0.8, y = max(density(x)$y) * 0.8, labels = paste("Mean =", round(a, 2), "\nSD =", round(b, 2)), col = "black", cex = 0.8, adj = c(0, 0))
+```
+
+Die Anzahl der Güterwagen pro Zug wird als normalverteilte Zufallsvariable behandelt (rote Linie). Es ergibt sich ein Mittelwert von `r round(a,2)` bei einer Standardabweichung von `r round(b,2)`. 
+Die Länge von Zügen ist annahmegemäß betaverteilt mit den Form-Parametern Alpha und Beta. Im ersten Plot ist die Länge der Züge auf [0,1] normiert dargestellt. Das zweite Plot rücktransformiert auf die tatsächlichen Längen in Meter. 
+
+```{r LENGTH OF TRAINS,echo=FALSE}
+#Wie lang sind Züge? --> Laenge Zuege
+x = data$abfahrtZugLaenge
+# Original-Minimum und -Maximum speichern
+x_min <- min(x)
+x_max <- max(x)
+#Transformation auf [0,1] / Min-Max-Skalierung
+x_scaled <- (x - x_min) / (x_max - x_min)
+a <- mean(x_scaled)
+b <- sd(x_scaled)
+# Histogramm der Daten erstellen
+hist(x_scaled, breaks = 50, probability = TRUE, xlab = "Value", col = "lightblue", main = "Laenge transformiert")
+# Formel für Parameterschätzung
+alpha_hat <- a * ((a * (1 - a) / b^2) - 1)
+beta_hat <- (1 - a) * ((a * (1 - a) / b^2) - 1)
+# Geschätzte Dichte über das Histogramm legen
+curve(dbeta(x, alpha_hat, beta_hat), col = "red", lwd = 2, add = TRUE)
+#Textbox hinzufügen
+text(x = max(x_scaled) * 0.4, y = max(density(x_scaled)$y) * 0.8, labels = paste("Mean =", round(a, 2), "\nSD =", round(b, 2)), col = "black", cex = 0.8, adj = c(0, 0))
+text(x = max(x_scaled) * 0.05, y = max(density(x_scaled)$y) * 0.8, labels = paste("Betaverteilung","\nAlpha =", round(alpha_hat, 2), "\nBeta =", round(beta_hat, 2)), col = "black", cex = 0.8, adj = c(0, 0))
+```
+
+```{r BACKTRANSFORM,echo=FALSE}
+# Rücktransformation der x-Werte von [0,1] auf Originalbereich
+x_vals_scaled <- seq(0, 1, length.out = 100)
+x_vals_original <- x_vals_scaled * (x_max - x_min) + x_min
+# Dichtewerte der Beta-Verteilung auf skalierten x-Werten
+y_vals <- dbeta(x_vals_scaled, alpha_hat, beta_hat)
+hist(x, breaks = 50, probability = TRUE, xlab = "Value", col = "lightblue", main = "Laenge [m] (transf. Betaverteilung)")
+lines(x_vals_original, y_vals / (x_max - x_min), col = "red", lwd = 2)
+```
+
+## Frequenzierung der Züge pro Tag
+
+Die Frequenzierung wird wegen tageszeitlichen Schwankungen durch eine (zweifach) gemixte Normalverteilung beschrieben. 
+
+```{r INTERVAL ARRIVAL,echo=FALSE}
+#In welchem Intervall kommen Züge?
+anzZuege = data_tagesverteilung$anzahlZuege
+#durchschnittliches Intervall in Minuten über 24 Stunden
+Q10 = 24/quantile(anzZuege,0.1)[[1]]*60
+Q25 = 24/quantile(anzZuege,0.25)[[1]]*60
+Q50 = 24/quantile(anzZuege,0.5)[[1]]*60
+Q75 = 24/quantile(anzZuege,0.75)[[1]]*60
+Q90 = 24/quantile(anzZuege,0.9)[[1]]*60
+Q100 = 24/max(anzZuege)*60
+
+# Versuche die Mischung zu berechnen und unterdrücke Konsolenausgabe
+mixmdl <- tryCatch({
+  suppressMessages(
+    suppressWarnings({
+      tmp <- NULL
+      invisible(capture.output({
+        tmp <- normalmixEM(anzZuege, k = 2)
+      }))
+      tmp
+    })
+  )
+}, error = function(e) {
+  message("Fehler bei der Modellanpassung: ", e$message)
+  return(NULL)
+})
+
+
+# Prüfe, ob das Modell erfolgreich erstellt wurde
+if (!is.null(mixmdl)) {
+  summary(mixmdl)
+  
+  hist(anzZuege, breaks = seq(min(anzZuege), max(anzZuege), length.out = 51), 
+       col = "lightblue", probability = TRUE, 
+       main = "Bimodale Verteilung mit angepasster Mischung")
+  
+  curve(mixmdl$lambda[1] * dnorm(x, mean = mixmdl$mu[1], sd = mixmdl$sigma[1]) + 
+          mixmdl$lambda[2] * dnorm(x, mean = mixmdl$mu[2], sd = mixmdl$sigma[2]), 
+        col = "red", lwd = 2, add = TRUE)
+  
+  lambda <- mixmdl$lambda
+  mu <- mixmdl$mu
+  sigma <- mixmdl$sigma
+  
+  # Textbox mit den Parametern hinzufügen
+  text(x = max(anzZuege) * 0.4, y = max(hist(anzZuege, plot = FALSE)$density) * 1.2, 
+     labels = paste("lambda1: ", round(lambda[1], 2), "lambda2: ", round(lambda[2], 2), "\n",
+                    "mu1: ", round(mu[1], 2), "mu2: ", round(mu[2], 2), "\n",
+                    "sigma1: ", round(sigma[1], 2), "sigma2: ", round(sigma[2], 2)), 
+     col = "blue", cex = 0.8, pos = 4)
+} else {
+  cat("Hinweis: Das Modell konnte nicht konvergieren.\n")
+}
+```
+
+Es ergeben sich folgende Quantile: 10%: `r Q10`, 25%: `r Q25`, 50%: `r Q50`, 75%: `r Q75`, 90%: `r Q90`, 100%: `r Q100`.
+
+```{r DAYS DAMAGES, include=FALSE}
+# Vektor mit Wochentagsnamen (1 = Montag, ..., 7 = Sonntag)
+wochentagsnamen <- c("Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag")
+
+plot_histogram_mit_mixmodell <- function(data, wochentag) {
+  datan <- data %>%
+    mutate(weekday = wday(tag, week_start = 1)) %>%
+    dplyr::filter(weekday == wochentag)
+  
+  anzZuege <- datan$anzahlZuege
+  
+  # Fehlerbehandlung und Unterdrückung der Ausgabe
+  mixmdl <- tryCatch({
+    suppressMessages(
+      suppressWarnings({
+        tmp <- NULL
+        invisible(capture.output({
+          tmp <- normalmixEM(anzZuege, k = 2)
+        }))
+        tmp
+      })
+    )
+  }, error = function(e) {
+    message("Fehler bei der Modellanpassung für ", wochentagsnamen[wochentag], ": ", e$message)
+    return(NULL)
+  })
+  
+  if (!is.null(mixmdl)) {
+    print(summary(mixmdl))
+    
+    hist(anzZuege, breaks = 50, col = "lightblue", probability = TRUE,
+         main = paste("Bimodale Verteilung der Zuganzahl (", wochentagsnamen[wochentag], ")"),
+         xlab = "Anzahl Züge")
+    
+    curve(mixmdl$lambda[1] * dnorm(x, mean = mixmdl$mu[1], sd = mixmdl$sigma[1]) + 
+            mixmdl$lambda[2] * dnorm(x, mean = mixmdl$mu[2], sd = mixmdl$sigma[2]), 
+          col = "red", lwd = 2, add = TRUE)
+    
+    text(x = max(anzZuege) * 0.4, y = max(hist(anzZuege, plot = FALSE)$density) * 1.2, 
+         labels = paste("lambda1: ", round(mixmdl$lambda[1], 2), "  lambda2: ", round(mixmdl$lambda[2], 2), "\n",
+                        "mu1: ", round(mixmdl$mu[1], 2), "  mu2: ", round(mixmdl$mu[2], 2), "\n",
+                        "sigma1: ", round(mixmdl$sigma[1], 2), "  sigma2: ", round(mixmdl$sigma[2], 2)), 
+         col = "blue", cex = 0.8, pos = 4)
+    
+    return(data.frame(
+      Wochentag = wochentagsnamen[wochentag],
+      lambda1 = mixmdl$lambda[1],
+      lambda2 = mixmdl$lambda[2],
+      mu1 = mixmdl$mu[1],
+      mu2 = mixmdl$mu[2],
+      sigma1 = mixmdl$sigma[1],
+      sigma2 = mixmdl$sigma[2]
+    ))
+  } else {
+    return(data.frame(
+      Wochentag = wochentagsnamen[wochentag],
+      lambda1 = NA,
+      lambda2 = NA,
+      mu1 = NA,
+      mu2 = NA,
+      sigma1 = NA,
+      sigma2 = NA
+    ))
+  }
+}
+
+# Tabelle initialisieren
+vec_table <- data.frame()
+
+# Schleife über alle Wochentage
+for (k in 1:7) {
+  vec <- plot_histogram_mit_mixmodell(data_tagesverteilung, k)
+  vec_table <- rbind(vec_table, vec)
+}
+```
+
+Separat über die Wochentage ergibt sich folgende Schätzung:
+
+```{r DAYS INTERACTIVE, echo=FALSE}
+# Alle numerischen Spalten auf 2 Nachkommastellen runden
+data_gerundet <- vec_table %>%
+  mutate(across(where(is.numeric), ~ round(., 2)))
+
+# Interaktive Tabelle mit Scrollen und gerundeten``` Werten
+datatable(data_gerundet, 
+          options = list(
+            pageLength = 10,
+            scrollX = TRUE,
+            autoWidth = TRUE,
+            columnDefs = list(list(width = '150px', targets = "_all"))
+          ))
+```
+
+## Wahrscheinlichkeit von Schäden
+Schäden werden typischerweise durch eine Weibullverteilung (mit zwei Formparametern) modelliert. 
+
+```{r PROBABILITIES, echo=FALSE}
+#Wie wahrscheinlich sind Schäden?
+anzSchaeden = data_tagesverteilung$durchschnittlicheAnzSchaeden
+#Erwartungswerte für Schaeden
+Q10 = quantile(anzSchaeden,0.1)[[1]]
+Q25 = quantile(anzSchaeden,0.25)[[1]]
+Q50 = quantile(anzSchaeden,0.5)[[1]]
+Q75 = quantile(anzSchaeden,0.75)[[1]]
+Q90 = quantile(anzSchaeden,0.9)[[1]]
+
+# Erstelle das Histogramm
+hist(anzSchaeden, breaks = 40, col = "lightblue", probability = TRUE, main = "Histogramm mit angepasster Weibullverteilung")
+# Beispielhafte Startwerte für die Weibullverteilung
+start_values <- list(shape = 1, scale = 1)
+# Passe die Weibullverteilung an
+fit <- fitdist(anzSchaeden, "weibull", start = start_values)
+# Füge die angepasste Weibullverteilung hinzu
+curve(dweibull(x, shape = fit$estimate["shape"], scale = fit$estimate["scale"]), 
+      col = "red", lwd = 2, add = TRUE)
+# Parameter anzeigen
+text(x = max(anzSchaeden) * 0.7, y = max(hist(anzSchaeden, plot = FALSE)$density) * 0.9, 
+     labels = paste("Weibullverteilung", "\nshape: ", round(fit$estimate["shape"], 2), "\nscale: ", round(fit$estimate["scale"], 2)), 
+     col = "blue", cex = 0.8, pos = 4)
+```
+
+Es ergeben sich folgende Quantile für die Anzahl der Schäden: 10%: `r Q10`, 25%: `r Q25`, 50%: `r Q50`, 75%: `r Q75`, 90%: `r Q90`.
+
+## Zusätzliche Begutachtungszeit durch Schäden
+
+```{r EXTRA TIME DAMAGES, include=FALSE}
+#Extrazeiten für Schäden einberaumen? 
+
+# Berechnung für numSchaden = 0
+mohne = mean(data$begutachtungMinuten[data$numSchaden == 0])
+sdohne = sd(data$begutachtungMinuten[data$numSchaden == 0])
+
+# Berechnung für numSchaden > 0
+mmit = mean(data$begutachtungMinuten[data$numSchaden > 0])
+sdmit = sd(data$begutachtungMinuten[data$numSchaden > 0])
+
+#mittlere Anzahl von Schäden
+mschaden = mean(data$numSchaden[data$numSchaden > 0])
+
+#mittlere Zeit für einen Schaden in [min]
+M = (mmit-mohne)/mschaden
+```
+
+Die durchschnittliche Begutachtungszeit ohne Schaden ist M1 = `r round(mohne,2)` (SD=`r round(sdohne,2)`). Die durchschnittliche Begutachtungszeit für mindestens einen Schaden ist M2 = `r round(mmit,2)` (SD=`r round(sdmit,2)`). Aus der mittleren Anzahl der Schäden (M = `r round(mschaden,2)`) berechnet man den Quotienten (M1 - M2)/M = `r round(M,2)`.
+
+```{r MEAN TWB TIME,echo=FALSE}
+df = data[data$numSchaden == 0,]
+
+# Grand Mean und Standardabweichung berechnen
+grand_mean <- mean(df$MinproAchse, na.rm = TRUE)
+grand_sd <- sd(df$MinproAchse, na.rm = TRUE)
+
+# Plot der Werte in der Spalte 'MinproAchse'
+plot1 <- ggplot(df, aes(x = seq_along(MinproAchse), y = MinproAchse)) +
+  geom_point(size = 0.5) +
+  geom_line(size = 0.2) +
+  geom_hline(yintercept = grand_mean, color = "blue", linetype = "dashed", size = 1) +
+  geom_hline(yintercept = grand_mean + grand_sd, color = "green", linetype = "dotted", size = 1) +
+  geom_hline(yintercept = grand_mean - grand_sd, color = "green", linetype = "dotted", size = 1) +
+  labs(title = "Verteilung der schadfreien Züge in der Spalte 'MinproAchse'",
+       x = "Index",
+       y = "Verhältnis (begutachtungMinuten / AbfahrtZugAchsen) [min]",
+       subtitle = paste("Grand Mean:", round(grand_mean, 2), "\nStandardabweichung:", round(grand_sd, 2))) +
+  theme_minimal()
+
+# Histogramm der y-Werte (MinproAchse) mit eingeschränkter x-Range
+plot2 <- ggplot(df, aes(x = MinproAchse)) +
+  geom_histogram(binwidth = 0.02, fill = "blue", color = "black", alpha = 0.7) +
+  labs(title = "Histogramm der schadfreien Züge in der Spalte 'MinproAchse'",
+       x = "Verhältnis (begutachtungMinuten / AbfahrtZugAchsen) [min]",
+       y = "Häufigkeit") +
+  xlim(0, 1.5) +
+  theme_minimal()
+
+# Beide Plots untereinander darstellen
+combined_plot <- plot1 / plot2
+
+# Plot anzeigen
+print(combined_plot)
+```
+
+## Analyse nach Schadklassen
+
+```{r DAMAGE CLASSES,echo=FALSE}
+data = list_out[[2]]
+
+freq_table = as.data.frame(table(na.omit(data$schaden)))
+
+colnames(freq_table) <- c("schaden", "haeufigkeit")
+
+freq_table_sorted <- freq_table[order(-freq_table$haeufigkeit), ]
+
+p <- ggplot(freq_table, aes(x = schaden, y = haeufigkeit)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Absolute Häufigkeitsverteilung der Schaden-Werte",
+       x = "Schaden",
+       y = "Absolute Häufigkeit") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+ggplotly(p) %>% layout(
+  title = list(text = "<br>Absolute Häufigkeitsverteilung der Schaden-Werte", 
+               x = 0.5, font = list(size = 18)),
+  margin = list(t = 100, b = 120),  # t = top margin
+  xaxis = list(tickangle = -45))
+```
+
+```{r DAMAGES FREQUENCIES,echo=FALSE}
+df = data
+# Schritt 1: Duplikate entfernen – nur ein Eintrag pro fahrzeugnummer und schaden
+df_unique <- unique(df[, c("fahrzeugnummer", "schaden")])
+
+# Schritt 2: Absolute Häufigkeit von schaden berechnen
+table_schaden <- as.data.frame(table(df_unique$schaden))
+colnames(table_schaden) <- c("schaden", "haeufigkeit")
+table_schaden_sorted <- table_schaden[order(-table_schaden$haeufigkeit), ]
+
+top30 = table_schaden_sorted[1:30,]
+
+
+ggplot(top30, aes(x = schaden, y = haeufigkeit)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  labs(title = "Absolute Häufigkeitsverteilung der Schaden-Werte (Top 30)",
+       x = "Schaden",
+       y = "Absolute Häufigkeit") +
+  theme_minimal() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+
