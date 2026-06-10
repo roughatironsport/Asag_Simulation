@@ -9,3 +9,12 @@ __pycache__/
 # R
 .Rhistory
 .RData
+
+# Reale Auftraggeber-Daten / daraus abgeleitete Berichte — niemals pushen!
+r_code/*.html
+*.csv
+*.parquet
+
+# Laufzeit-Ergebnisse
+results_step_*.json
+analysis_results/
