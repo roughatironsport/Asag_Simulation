@@ -4,7 +4,16 @@ Ereignisdiskrete Simulation der **technischen Wagenbehandlung (TWB)** von Güter
 
 Die Simulationsparameter sind empirisch fundiert: Eine begleitende R-Auswertung (`r_code/PVG_analysis.Rmd`) analysiert reale PVG-Daten (Schadeinträge der Wagenmeister) und liefert u. a. Begutachtungszeiten pro Achse sowie Zugankunftsverteilungen pro Wochentag.
 
-> Eine detaillierte Beschreibung der Komponenten und ihrer Abhängigkeiten findet sich in [architecture.md](architecture.md).
+> **Projektstatus: abgeschlossen.** Mit dem Modell wurde eine umfangreiche **Monte-Carlo-Simulationsstudie** über einen vollfaktoriellen Versuchsplan (3×4×4×2 = **96 Faktorstufenkombinationen** × 1000 Replikationen = **96.000 Iterationen**) sowie eine fokussierte Zusatzstudie unter Ressourcenknappheit (6.000 Iterationen) durchgeführt.
+>
+> **Dokumentation:** [architecture.md](architecture.md) (Komponenten & Abhängigkeiten) · [docs/simulationsstudie.md](docs/simulationsstudie.md) (Versuchsdesign & Methode) · [docs/ergebnisse.md](docs/ergebnisse.md) (Befunde & Auswertung).
+
+## Architektur
+
+<p align="center">
+  <img src="docs/architecture_overview.png" alt="Architektur-Diagramm: Module und Datenflüsse des ASAG-Simulationssystems" width="720"><br>
+  <em>Modulübersicht: Das Integrator-Modul (Startscreen-UI) orchestriert PVG-Analyse (R), Infrastruktur-Modul, Parameter-Choice und Simulations-Iterator; der Datenaustausch läuft über JSON-Dateien, ein PostgreSQL-DBMS dient der Zwischenspeicherung der Ein-/Ausgabedaten. Mehr Details in <a href="architecture.md">architecture.md</a>.</em>
+</p>
 
 ## Projektstruktur
 
@@ -23,6 +32,10 @@ AsagSimulation/
 ├── analysis_results/         # (wird zur Laufzeit benötigt, siehe Installation)
 │   └── simulation_ergebnisse.xlsx
 ├── docs/
+│   ├── architecture_overview.png  # Architektur-Diagramm (Modulübersicht)
+│   ├── simulationsstudie.md  # Versuchsdesign & Methodik der Monte-Carlo-Studie
+│   ├── ergebnisse.md         # Befunde & Auswertung (mit Ergebnis-Plots)
+│   ├── ergebnisse/           # Ergebnis-Plots (Fehlerbalken: Mittelwert ± 95-%-KI)
 │   └── screenshots/          # Screenshots für die Dokumentation
 └── requirements.txt          # Python-Abhängigkeiten (UTF-16-kodiert)
 ```
@@ -100,9 +113,39 @@ python py_code/main.py [step_id]
 
 Liest die Parameter aus `json_files/simulation_data.json` (fehlende Werte werden durch Code-Defaults ersetzt) und schreibt `results_step_<step_id>.json` in das aktuelle Arbeitsverzeichnis.
 
+## Simulationsstudie
+
+Mit dem Modell wurde eine **Monte-Carlo-Simulationsstudie** als **vollständiges faktorielles Design** durchgeführt: Alle Faktorstufenkombinationen wurden simuliert, jede Zelle über **1000 unabhängige Replikationen** ausgewertet (Mittelwert + 95-%-Konfidenzintervall).
+
+| Faktor | Parameter | Stufen |
+|---|---|---|
+| Vertrauen in die KI | `TRUST_AI_PROB` | high / med / low (0,9 / 0,7 / 0,5) |
+| Menschliche Entscheidungsgüte | `HUMAN_INSP_PROB` | high / good / bad / very bad (0,99 / 0,9 / 0,8 / 0,7) |
+| KI-Güte (FN-/FP-Rate) | `FALSE_NEGATIVE` / `FALSE_POSITIVE` | near_perfect / good / med / bad |
+| Digitale Begutachtungszeit | `INSP_TIME_SCREEN_PER_WAGON` | med / slow (1 / 2) |
+
+→ **3 × 4 × 4 × 2 = 96 Kombinationen × 1000 = 96.000 Iterationen.** Eine zweite Studie variierte Vertrauen (high/low) × KI-Güte (3-stufig) unter **Ressourcenknappheit** (+~30 % Frequenzierung, verdoppelte Gleisentfernungen), je 1000 Replikationen = 6.000 Iterationen.
+
+Vollständiges Versuchsdesign, Modellbildung und Validierung: **[docs/simulationsstudie.md](docs/simulationsstudie.md)**.
+
 ## Ergebnisse
 
-Die Excel-Datei `analysis_results/simulation_ergebnisse.xlsx` enthält fünf Blätter:
+Die zentralen Befunde der Studie — Interaktionen von KI-Güte, Vertrauen und menschlicher Güte, Fehlerraten, *automation bias* und das Verhalten unter Ressourcenknappheit — sind ausführlich in **[docs/ergebnisse.md](docs/ergebnisse.md)** dokumentiert (mit Ergebnis-Plots).
+
+<p align="center">
+  <img src="docs/ergebnisse/plots_inspectors/total_inspection_time__HUMAN_high.png" alt="Gesamtbegutachtungszeit über Vertrauen und KI-Güte" width="480"><br>
+  <em>Beispielbefund: Die Gesamtbegutachtungszeit steigt bei schwacher KI-Güte (rot) und geringem Vertrauen deutlich an (Inkonsistenzkosten), während sie bei guter/near-perfect KI (blau/grün) zum Optimum konvergiert. Mittelwert ± 95-%-KI über die Vertrauensstufen.</em>
+</p>
+
+**Kernbefunde in Kürze:**
+
+- **Inkonsistenzkosten:** schwache KI + geringes Vertrauen ⇒ bis zu **+50 %** (Worst Case **+60 %**) Gesamtbegutachtungszeit; bei guter KI verschwindet der Effekt.
+- **Automation bias:** Die Konstellation **schwache KI × hohes Vertrauen** ist die riskanteste für die diagnostische Qualität (weniger gefundene wahre Schäden).
+- **Ressourcenknappheit:** System resilient; jedoch sinkt der Durchsatz unter kritischer Konstellation (~18 → ~15,5 Züge) und es zeigt sich eine **adaptive Umkehr** des Vertrauenseffekts.
+
+### Aufbau der Excel-Ausgabe
+
+Jeder Simulationslauf (bzw. jede Kampagne) exportiert eine Excel-Datei (`analysis_results/simulation_ergebnisse.xlsx`) mit fünf Blättern:
 
 | Blatt | Inhalt |
 |---|---|
@@ -118,6 +161,7 @@ Die Excel-Datei `analysis_results/simulation_ergebnisse.xlsx` enthält fünf Bl�
 
 - Die Rohdaten (CSV/Parquet) liegen außerhalb des Repos und werden ausschließlich über absolute lokale Pfade gelesen.
 - Gerenderte Berichte (`r_code/*.html`) betten die zugrunde liegenden Datenpunkte ein (interaktive plotly-/DT-Elemente, u. a. reale Zugnummern und Tageswerte) und sind daher per `.gitignore` vom Versionieren ausgeschlossen — ebenso `*.csv`, `*.parquet`, `results_step_*.json` und `analysis_results/`.
+- Ebenfalls bewusst **nicht** versioniert (per `.gitignore`): der Projekt-Abschlussbericht (`*.docx`), `Netz.pdf` und die rohen Simulationsergebnisse (`Ergebnisse Asag/`, xlsx). Ins Repo gelangen nur **abgeleitete Doku-Artefakte**: das gerenderte Architektur-Diagramm und die aggregierten Ergebnis-Plots (Mittelwerte/95-%-KI, keine Einzeldaten).
 - Vor jedem Push prüfen: `git status` und `git diff --cached --stat` dürfen keine Daten-Artefakte enthalten.
 
 ## Bekannte Einschränkungen

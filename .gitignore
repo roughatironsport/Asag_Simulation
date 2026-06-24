@@ -18,3 +18,8 @@ r_code/*.html
 # Laufzeit-Ergebnisse
 results_step_*.json
 analysis_results/
+
+# Quell- und Rohdaten der Studie — nicht versionieren (nur abgeleitete Doku-Artefakte/Plots in docs/)
+*.docx
+Netz.pdf
+Ergebnisse Asag/

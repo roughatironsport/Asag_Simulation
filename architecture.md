@@ -2,9 +2,29 @@
 
 Dieses Dokument beschreibt die Komponenten des Projekts, ihre Schnittstellen und die gegenseitigen Abhängigkeiten.
 
+## Modulübersicht
+
+<p align="center">
+  <img src="docs/architecture_overview.png" alt="Architektur-Diagramm: Module und Datenflüsse des ASAG-Simulationssystems" width="760"><br>
+  <em>Übersicht der Module und ihrer Datenflüsse: Das Integrator-Modul (Startscreen-UI) orchestriert PVG-Analyse (R), Infrastruktur-Modul, Parameter-Choice und Simulations-Iterator. Der Austausch zwischen den Modulen erfolgt über JSON-Dateien; ein objektrelationales DBMS (PostgreSQL) dient der Zwischenspeicherung von Ein- und Ausgabedaten. Die R-Analyse erzeugt einen HTML-Bericht, der Simulations-Iterator eine XLSX-Auswertung.</em>
+</p>
+
+Die Modulbezeichnungen im Diagramm bilden auf die folgenden Quellartefakte ab:
+
+| Modul im Diagramm | Implementierung | Aufgabe |
+|---|---|---|
+| **Integrator-Modul / Startscreen-UI** | [py_code/Startscreen.py](py_code/Startscreen.py) | Haupt-GUI, Orchestrierung, Aggregation, Export |
+| **PVG-Analyse R-Modul** | [r_code/PVG_analysis.Rmd](r_code/PVG_analysis.Rmd) (via Pandoc) | Empirische Datenanalyse, HTML-Bericht |
+| **Infrastruktur-Modul** | [py_code/UI_1.py](py_code/UI_1.py) | Grafischer Gleislayout-Designer, Distanzberechnung |
+| **Parameter-Choice** | Parametrierung in [py_code/Startscreen.py](py_code/Startscreen.py) (Einstellungsfenster) | Auswahl/Serialisierung der Simulationsparameter |
+| **Simulations-Iterator** | [py_code/main.py](py_code/main.py) (N-fach als Subprozess) | SimPy-Kern, Monte-Carlo-Replikationen, XLSX-Export |
+| **PostgreSQL** | objektrelationales DBMS | Zwischenspeicherung von Ein-/Ausgabedaten als SQL-Tabellen |
+
+> Dieses Repository enthält den vollständigen, **abgeschlossenen** Stand des Projekts. Mit dem Modell wurde eine umfangreiche Simulationsstudie als wiederholte **Monte-Carlo-Experimente** über einen vollfaktoriellen Versuchsplan gefahren — siehe [docs/simulationsstudie.md](docs/simulationsstudie.md) (Design & Methode) und [docs/ergebnisse.md](docs/ergebnisse.md) (Befunde).
+
 ## Überblick
 
-Das System besteht aus vier aktiven Komponenten und einer Reihe von Datendateien, über die sie gekoppelt sind. Es gibt **keine direkten Python-Imports zwischen den Komponenten** — die Kopplung erfolgt ausschließlich über **Subprozess-Aufrufe** und **Dateien (JSON/Excel/HTML)**.
+Das System besteht aus vier aktiven Komponenten und einer Reihe von Datendateien, über die sie gekoppelt sind. Es gibt **keine direkten Python-Imports zwischen den Komponenten** — die Kopplung erfolgt über **Subprozess-Aufrufe**, **Dateien (JSON/Excel/HTML)** und ein **objektrelationales DBMS (PostgreSQL)**, das Ein- und Ausgabedaten als SQL-Tabellen zwischenspeichert und so eine konsistente Datenhaltung mit schnellen Zugriffszeiten gewährleistet.
 
 ```mermaid
 flowchart TB
@@ -112,6 +132,10 @@ Analysiert reale PVG-Einträge (Schadmeldungen der Wagenmeister) und liefert die
 - **Analysen/Schätzungen:** Begutachtungszeit pro Achse und pro Meter, Verteilung der Wagenanzahl (Normal) und Zuglänge (Beta), Schadenswahrscheinlichkeit (Weibull), Fourier-Analyse der Zugfrequenz, **Normalmischungs-Schätzung der Zuganzahl je Wochentag (`mixtools::normalmixEM`)**, Schadklassen-Häufigkeiten.
 - **Output:** `PVG_analysis.html` (interaktiver Bericht mit plotly/DT).
 
+### 5. PostgreSQL — Persistenzschicht
+
+Objektrelationales Datenbankmanagementsystem zur **Zwischenspeicherung von Ein- und Ausgabedaten in Form von SQL-Tabellen**. Es ergänzt den dateibasierten Austausch (JSON/Excel/HTML) um eine konsistente, schnell abfragbare Datenhaltung — insbesondere für die umfangreichen Ergebnisreihen der Monte-Carlo-Studie (96.000 Iterationen aus dem vollfaktoriellen Versuchsplan, s. [docs/simulationsstudie.md](docs/simulationsstudie.md)). Das Integrator-Modul schreibt Konfigurations-/Eingabedaten und liest die aggregierten Simulationsergebnisse zurück; die Übergabe erfolgt serialisiert über JSON.
+
 ## Datenschnittstellen (Verträge)
 
 ### `json_files/simulation_data.json`
@@ -208,6 +232,7 @@ sequenceDiagram
 | `UI_1.py` | `simulation_data.json` | `simulation_data.json` (nur `simulation_distances`) | — |
 | `main.py` | `simulation_data.json` | `results_step_<i>.json` | — |
 | `PVG_analysis.Rmd` | `r_input.json`, externe PVG-Rohdaten | `PVG_analysis.html` | — |
+| PostgreSQL | Eingabe-/Konfigurationsdaten (JSON) | Ein-/Ausgabedaten als SQL-Tabellen | — |
 
 Daraus folgt die Startreihenfolge: **Parameter speichern → Bahnhof-Creator → Simulation.** `main.py` funktioniert auch ohne die GUIs (Code-Defaults bzw. vorhandene JSON), und die R-Analyse ist vollständig optional — sie wird nur zur (Neu-)Schätzung der empirischen Parameter benötigt.
 
